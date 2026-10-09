@@ -90,6 +90,16 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
+     # This is CORRECT in .github/workflows/ci-cd.yml
+      - name: Deploy to Staging
+        run: |
+          helm upgrade --install employee-api \
+            oci://ghcr.io/ccdennar/helm-charts/employee-api \
+            --version "${{ github.sha }}" \
+            --namespace staging \
+            --kubeconfig kubeconfig \
+            --set image.tag="${{ github.sha }}" \
+            --wait --timeout=300s 
       - name: Configure kubectl
         run: echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
       - name: Install jq
