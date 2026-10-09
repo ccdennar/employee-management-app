@@ -1,0 +1,9 @@
+{
+  "first_name": "",
+  "last_name": "Smith",
+  "email": "invalid-email",
+  "department": "Engineering",
+  "job_title": "DevOps Engineer",
+  "salary": -5000,
+  "employment_status": "INVALID_STATUS"
+}

@@ -1,0 +1,9 @@
+{
+  "first_name": "Jane",
+  "last_name": "Doe",
+  "email": "john.smith@example.com",
+  "department": "Marketing",
+  "job_title": "Manager",
+  "salary": 85000,
+  "employment_status": "ACTIVE"
+}
