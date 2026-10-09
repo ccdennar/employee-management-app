@@ -68,29 +68,23 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: staging
+    if: false # DISABLED: Waiting for remote cluster kubeconfig
     steps:
       - uses: actions/checkout@v4
+      
       - name: Configure kubectl
-        run: echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
-      - name: Install Helm and yq
         run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          sudo snap install yq
-      - name: Deploy to Staging
-        run: |
-          helm upgrade --install employee-api \
-            oci://ghcr.io/ccdennar/helm-charts/employee-api \
-            --version "$(yq '.appVersion' Chart.yaml)" \
-            --namespace staging \
-            --kubeconfig kubeconfig \
-            --set image.tag="${{ github.sha }}"
-
-  smoke-test:
-    needs: deploy-staging
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-     # This is CORRECT in .github/workflows/ci-cd.yml
+          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          ls -la kubeconfig
+          head -n 3 kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
+            echo " CLUSTER UNREACHABLE - Verify KUBECONFIG secret"
+            exit 1
+          }
+      
+      - name: Install Helm
+        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      
       - name: Deploy to Staging
         run: |
           helm upgrade --install employee-api \
@@ -99,17 +93,33 @@ jobs:
             --namespace staging \
             --kubeconfig kubeconfig \
             --set image.tag="${{ github.sha }}" \
-            --wait --timeout=300s 
+            --wait --timeout=300s
+
+  smoke-test:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: staging
+    if: false # DISABLED: Waiting for remote cluster kubeconfig
+    steps:
       - name: Configure kubectl
-        run: echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+        run: |
+          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
+            echo "❌ CLUSTER UNREACHABLE in smoke-test"
+            exit 1
+          }
+      
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+      
       - name: Wait for Rollout
         run: kubectl rollout status deployment/employee-api --namespace staging --timeout=300s --kubeconfig kubeconfig
+      
       - name: Health Check
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://staging.employee-api.example.com/health/live)
           [ "$STATUS" = "200" ] || { echo "Health check failed: $STATUS"; exit 1; }
+      
       - name: Create-Delete Cycle
         run: |
           CREATE=$(curl -s -X POST https://staging.employee-api.example.com/api/v1/employees \
@@ -125,12 +135,19 @@ jobs:
   rollback:
     needs: smoke-test
     runs-on: ubuntu-latest
-    if: failure()
+    if: failure() # Only runs if smoke-test fails (currently disabled by parent job)
     environment: staging
     steps:
       - name: Configure kubectl
-        run: echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+        run: |
+          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
+            echo "❌ CLUSTER UNREACHABLE during rollback"
+            exit 1
+          }
+      
       - name: Install Helm
         run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      
       - name: Rollback
         run: helm rollback employee-api --namespace staging --kubeconfig kubeconfig
