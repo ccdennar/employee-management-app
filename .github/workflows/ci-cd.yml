@@ -6,9 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:15
@@ -37,15 +41,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Tests
+      - name: Run tests
         env:
-          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/employee_db"
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/employee_db
         run: pytest tests/ -v
 
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     permissions:
       contents: read
       packages: write
@@ -60,7 +65,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker Image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -74,106 +79,231 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
 
-    steps:
-      - uses: actions/checkout@v4
+    # Serialize staging deployments, including smoke tests and rollback.
+    concurrency:
+      group: employee-api-staging
+      cancel-in-progress: false
 
-      - name: Configure kubectl
-        shell: bash
-        env:
-          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
-        run: |
-          set -euo pipefail
-          umask 077
-          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
+    permissions:
+      contents: read
+      packages: read
+
+    env:
+      KUBECONFIG: ${{ runner.temp }}/vcluster-kubeconfig
+      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
+      HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
+      STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+      IMAGE_TAG: ${{ github.sha }}
+      RELEASE_NAME: employee-api
+      DEPLOY_NAMESPACE: staging
+
+    steps:
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
 
       - name: Install Helm
-        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
 
-      - name: Deploy to Staging
+      - name: Validate deployment settings
+        shell: bash
         run: |
-          helm upgrade --install employee-api \
-            oci://ghcr.io/ccdennar/helm-charts/employee-api \
-            --version "${{ github.sha }}" \
-            --namespace staging \
-            --kubeconfig kubeconfig \
-            --set image.tag="${{ github.sha }}" \
-            --wait --timeout=300s
+          set -euo pipefail
+          : "${HELM_CHART_VERSION:?Set the staging HELM_CHART_VERSION variable}"
+          : "${STAGING_BASE_URL:?Set the staging STAGING_BASE_URL variable}"
 
-  smoke-test:
-    needs: deploy-staging
-    runs-on: ubuntu-latest
-    environment: staging
-
-    steps:
-      - name: Configure kubectl
+      - name: Configure vCluster access
         shell: bash
         env:
-          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
+          VCLUSTER_KUBECONFIG_BASE64: ${{ secrets.VCLUSTER_KUBECONFIG_BASE64 }}
         run: |
           set -euo pipefail
           umask 077
-          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+          : "${VCLUSTER_KUBECONFIG_BASE64:?Set the staging VCLUSTER_KUBECONFIG_BASE64 secret}"
 
-      - name: Wait for Rollout
+          printf '%s' "$VCLUSTER_KUBECONFIG_BASE64" \
+            | base64 --decode > "$KUBECONFIG"
+
+          # Reject local certificate paths before attempting deployment.
+          kubectl config view --minify -o json | python3 -c '
+          import json
+          import sys
+
+          config = json.load(sys.stdin)
+          references = []
+
+          for entry in config.get("clusters", []):
+              if entry.get("cluster", {}).get("certificate-authority"):
+                  references.append("certificate-authority")
+
+          for entry in config.get("users", []):
+              user = entry.get("user", {})
+              for field in ("client-certificate", "client-key", "tokenFile"):
+                  if user.get(field):
+                      references.append(field)
+
+          if references:
+              sys.exit(
+                  "Kubeconfig references local credential files: "
+                  + ", ".join(references)
+                  + ". Export a self-contained vCluster kubeconfig."
+              )
+          '
+
+          kubectl cluster-info --request-timeout=10s
+
+      - name: Log in to Helm registry
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" \
+            | helm registry login ghcr.io \
+                --username "$GHCR_USERNAME" \
+                --password-stdin
+
+      - name: Record existing release revision
+        id: previous
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REVISION=$(
+            helm list \
+              --namespace "$DEPLOY_NAMESPACE" \
+              --all \
+              --filter "^${RELEASE_NAME}$" \
+              --output json \
+            | jq -r '.[0].revision // empty'
+          )
+
+          printf 'revision=%s\n' "$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to vCluster
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm upgrade --install "$RELEASE_NAME" \
+            "$HELM_CHART" \
+            --version "$HELM_CHART_VERSION" \
+            --namespace "$DEPLOY_NAMESPACE" \
+            --create-namespace \
+            --set-string image.tag="$IMAGE_TAG" \
+            --atomic \
+            --wait \
+            --timeout 300s
+
+      - name: Smoke tests
+        id: smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_URL="${STAGING_BASE_URL%/}"
+
           kubectl rollout status deployment/employee-api \
-            --namespace staging \
-            --timeout=300s \
-            --kubeconfig kubeconfig
+            --namespace "$DEPLOY_NAMESPACE" \
+            --timeout=300s
 
-      - name: Health Check
-        run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://staging.employee-api.example.com/health/live)
-          [ "$STATUS" = "200" ] || {
-            echo "Health check failed: $STATUS"
+          STATUS=$(
+            curl --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "$BASE_URL/health/live"
+          )
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed: HTTP $STATUS"
             exit 1
+          fi
+
+          EMAIL="smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}@example.com"
+
+          PAYLOAD=$(
+            jq -n --arg email "$EMAIL" '{
+              first_name: "Smoke",
+              last_name: "Test",
+              email: $email,
+              department: "QA",
+              job_title: "Tester",
+              salary: 1,
+              employment_status: "ACTIVE"
+            }'
+          )
+
+          CREATE=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --request POST \
+              "$BASE_URL/api/v1/employees" \
+              --header "Content-Type: application/json" \
+              --data "$PAYLOAD"
+          )
+
+          EMP_ID=$(
+            printf '%s' "$CREATE" \
+              | jq -er '.id | select(. != null and . != "") | tostring | @uri'
+          )
+
+          cleanup_employee() {
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --request DELETE \
+              "$BASE_URL/api/v1/employees/$EMP_ID" \
+              --output /dev/null
           }
 
-      - name: Create-Delete Cycle
-        run: |
-          CREATE=$(curl -s -X POST https://staging.employee-api.example.com/api/v1/employees \
-            -H "Content-Type: application/json" \
-            -d '{"first_name":"Smoke","last_name":"Test","email":"smoke@test.com","department":"QA","job_title":"Tester","salary":1,"employment_status":"ACTIVE"}')
+          # Attempt cleanup even when the read check fails.
+          trap 'cleanup_employee || true' EXIT
 
-          EMP_ID=$(echo "$CREATE" | jq '.id')
-          GET=$(curl -s "https://staging.employee-api.example.com/api/v1/employees/$EMP_ID")
-          NAME=$(echo "$GET" | jq -r '.first_name')
+          GET=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "$BASE_URL/api/v1/employees/$EMP_ID"
+          )
 
-          [ "$NAME" = "Smoke" ] || {
+          NAME=$(printf '%s' "$GET" | jq -er '.first_name')
+
+          if [ "$NAME" != "Smoke" ]; then
             echo "Expected Smoke, got $NAME"
             exit 1
-          }
+          fi
 
-          curl -s -X DELETE "https://staging.employee-api.example.com/api/v1/employees/$EMP_ID"
-          echo "✅ Smoke test passed"
+          cleanup_employee
+          trap - EXIT
 
-  rollback:
-    needs: smoke-test
-    runs-on: ubuntu-latest
-    if: failure()
-    environment: staging
+          echo "Smoke tests passed"
 
-    steps:
-      - name: Configure kubectl
+      - name: Roll back after failed smoke tests
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
         shell: bash
         env:
-          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
+          PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
         run: |
           set -euo pipefail
-          umask 077
-          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
 
-      - name: Install Helm
-        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          if [ -z "$PREVIOUS_REVISION" ]; then
+            echo "First installation: no previous release revision to restore."
+            exit 1
+          fi
 
-      - name: Rollback
-        run: |
-          helm rollback employee-api \
-            --namespace staging \
-            --kubeconfig kubeconfig
+          helm rollback "$RELEASE_NAME" "$PREVIOUS_REVISION" \
+            --namespace "$DEPLOY_NAMESPACE" \
+            --wait \
+            --timeout 300s
+
+      - name: Remove kubeconfig
+        if: always()
+        shell: bash
+        run: rm -f "$KUBECONFIG"
