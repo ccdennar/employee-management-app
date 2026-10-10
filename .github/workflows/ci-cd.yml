@@ -64,6 +64,11 @@ jobs:
           REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/${REPOSITORY}/employee-api" >> "$GITHUB_OUTPUT"
 
+      # QEMU lets the amd64 GitHub runner build the arm64 variant that
+      # minikube on Apple Silicon needs.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -79,6 +84,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
