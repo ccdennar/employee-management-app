@@ -212,21 +212,67 @@ jobs:
       - name: Deploy to vCluster
         id: deploy
         shell: bash
+        env:
+          PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
         run: |
           set -euo pipefail
 
           # Portable lowercase (macOS bash 3.2 has no ${VAR,,}).
           REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
 
+          # No --atomic here: atomic deletes the failed pods before anyone can
+          # see why they failed. Instead, deploy, and on failure print
+          # diagnostics first, then restore the previous state ourselves.
+          set +e
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
             --version "$HELM_CHART_VERSION" \
             --namespace "$DEPLOY_NAMESPACE" \
             --create-namespace \
             --set-string image.repository="ghcr.io/${REPOSITORY}/employee-api" \
             --set-string image.tag="$IMAGE_TAG" \
-            --atomic \
             --wait \
             --timeout 300s
+          HELM_EXIT=$?
+          set -e
+
+          if [ "$HELM_EXIT" -ne 0 ]; then
+            echo "::group::Deployment diagnostics"
+
+            echo "--- pods ---"
+            kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o wide || true
+
+            echo "--- describe pods ---"
+            kubectl describe pods --namespace "$DEPLOY_NAMESPACE" || true
+
+            echo "--- events ---"
+            kubectl get events --namespace "$DEPLOY_NAMESPACE" \
+              --sort-by=.lastTimestamp || true
+
+            echo "--- container logs ---"
+            for POD in $(kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o name); do
+              echo ">>> $POD (current)"
+              kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+                --all-containers --tail=100 || true
+              echo ">>> $POD (previous)"
+              kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+                --all-containers --previous --tail=100 2>/dev/null || true
+            done
+
+            echo "::endgroup::"
+
+            echo "Deployment failed. Restoring previous state."
+            if [ -n "$PREVIOUS_REVISION" ]; then
+              helm rollback "$RELEASE_NAME" "$PREVIOUS_REVISION" \
+                --namespace "$DEPLOY_NAMESPACE" \
+                --wait \
+                --timeout 300s || true
+            else
+              helm uninstall "$RELEASE_NAME" \
+                --namespace "$DEPLOY_NAMESPACE" || true
+            fi
+
+            exit "$HELM_EXIT"
+          fi
 
       - name: Smoke tests
         id: smoke
