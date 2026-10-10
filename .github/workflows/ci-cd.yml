@@ -395,6 +395,39 @@ jobs:
 
           echo "Smoke tests passed"
 
+      - name: Diagnostics after failed smoke tests
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "--- pods ---"
+          kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o wide || true
+
+          echo "--- restart reasons (last terminated state) ---"
+          kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o json \
+            | jq -r '.items[] | .metadata.name as $p
+                | .status.containerStatuses[]?
+                | "\($p) restarts=\(.restartCount) last=\(.lastState.terminated.reason // "none") exit=\(.lastState.terminated.exitCode // "-")"' \
+            || true
+
+          echo "--- describe pods ---"
+          kubectl describe pods --namespace "$DEPLOY_NAMESPACE" || true
+
+          echo "--- events ---"
+          kubectl get events --namespace "$DEPLOY_NAMESPACE" \
+            --sort-by=.lastTimestamp || true
+
+          echo "--- container logs ---"
+          for POD in $(kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o name); do
+            echo ">>> $POD (current)"
+            kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+              --all-containers --tail=100 || true
+            echo ">>> $POD (previous)"
+            kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+              --all-containers --previous --tail=100 2>/dev/null || true
+          done
+
       - name: Roll back after failed smoke tests
         if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
         shell: bash
