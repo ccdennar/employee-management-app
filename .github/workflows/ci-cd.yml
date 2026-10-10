@@ -61,7 +61,7 @@ jobs:
         id: image
         shell: bash
         run: |
-          REPOSITORY="${GITHUB_REPOSITORY,,}"
+          REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/${REPOSITORY}/employee-api" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -88,7 +88,9 @@ jobs:
     # Deployment requires both tests and image publication to succeed.
     needs: [test, build-and-push]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: self-hosted
+    # Runs on the Mac that hosts minikube/vCluster (the cluster is only
+    # reachable from that machine via 127.0.0.1:8443 port-forward).
+    runs-on: [self-hosted, macOS, ARM64]
     environment: staging
 
     concurrency:
@@ -100,19 +102,25 @@ jobs:
       packages: read
 
     # NOTE: the `runner` context is NOT available at job-level env,
-    # so KUBECONFIG is exported from a step instead (see "Set kubeconfig path").
+    # so KUBECONFIG is exported from a step instead.
     env:
       HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
       HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
-      STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
       IMAGE_TAG: ${{ github.sha }}
       RELEASE_NAME: employee-api
       DEPLOY_NAMESPACE: staging
+      # Override with repo/environment variables if your chart names differ.
+      DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME || 'employee-api' }}
+      SERVICE_NAME: ${{ vars.SERVICE_NAME || 'employee-api' }}
 
     steps:
-      - name: Set kubeconfig path
+      - name: Set kubeconfig path and tool PATH
         shell: bash
-        run: echo "KUBECONFIG=${RUNNER_TEMP}/vcluster-kubeconfig" >> "$GITHUB_ENV"
+        run: |
+          echo "KUBECONFIG=${RUNNER_TEMP}/vcluster-kubeconfig" >> "$GITHUB_ENV"
+          # Homebrew locations (Apple Silicon and Intel) for jq, curl, etc.
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -122,12 +130,22 @@ jobs:
         with:
           version: v3.17.3
 
+      - name: Check required tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in jq curl kubectl helm; do
+            command -v "$tool" >/dev/null 2>&1 || {
+              echo "Missing required tool: $tool (on macOS: brew install $tool)"
+              exit 1
+            }
+          done
+
       - name: Validate deployment settings
         shell: bash
         run: |
           set -euo pipefail
           : "${HELM_CHART_VERSION:?Set staging variable HELM_CHART_VERSION}"
-          : "${STAGING_BASE_URL:?Set staging variable STAGING_BASE_URL}"
 
       - name: Configure vCluster access
         shell: bash
@@ -142,30 +160,23 @@ jobs:
           printf '%s' "$VCLUSTER_KUBECONFIG_BASE64" \
             | base64 --decode > "$KUBECONFIG"
 
-          kubectl config view --minify -o json | python3 -c '
-          import json
-          import sys
+          # Reject kubeconfigs that point at local credential files.
+          LOCAL_REFS=$(
+            kubectl config view --minify -o json | jq -r '
+              [
+                (.clusters[]?.cluster | select(has("certificate-authority")) | "certificate-authority"),
+                (.users[]?.user | select(has("client-certificate")) | "client-certificate"),
+                (.users[]?.user | select(has("client-key")) | "client-key"),
+                (.users[]?.user | select(has("tokenFile")) | "tokenFile")
+              ] | join(", ")
+            '
+          )
 
-          config = json.load(sys.stdin)
-          references = []
-
-          for entry in config.get("clusters", []):
-              if entry.get("cluster", {}).get("certificate-authority"):
-                  references.append("certificate-authority")
-
-          for entry in config.get("users", []):
-              user = entry.get("user", {})
-              for field in ("client-certificate", "client-key", "tokenFile"):
-                  if user.get(field):
-                      references.append(field)
-
-          if references:
-              sys.exit(
-                  "Kubeconfig references local credential files: "
-                  + ", ".join(references)
-                  + ". Supply a self-contained vCluster kubeconfig."
-              )
-          '
+          if [ -n "$LOCAL_REFS" ]; then
+            echo "Kubeconfig references local credential files: $LOCAL_REFS"
+            echo "Supply a self-contained vCluster kubeconfig."
+            exit 1
+          fi
 
           kubectl cluster-info --request-timeout=10s
 
@@ -204,7 +215,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          REPOSITORY="${GITHUB_REPOSITORY,,}"
+          # Portable lowercase (macOS bash 3.2 has no ${VAR,,}).
+          REPOSITORY=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
 
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
             --version "$HELM_CHART_VERSION" \
@@ -221,21 +233,61 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASE_URL="${STAGING_BASE_URL%/}"
 
-          kubectl rollout status deployment/employee-api \
+          LOCAL_PORT=18080
+          BASE_URL="http://127.0.0.1:${LOCAL_PORT}"
+          PF_PID=""
+          EMP_ID=""
+
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" \
             --namespace "$DEPLOY_NAMESPACE" \
             --timeout=300s
 
-          STATUS=$(
-            curl --silent --show-error \
-              --connect-timeout 10 --max-time 30 \
-              --output /dev/null --write-out '%{http_code}' \
-              "$BASE_URL/health/live"
+          # Discover the Service port instead of hard-coding it.
+          SERVICE_PORT=$(
+            kubectl get svc "$SERVICE_NAME" \
+              --namespace "$DEPLOY_NAMESPACE" \
+              -o jsonpath='{.spec.ports[0].port}'
           )
+          echo "Port-forwarding svc/${SERVICE_NAME}:${SERVICE_PORT} -> 127.0.0.1:${LOCAL_PORT}"
+
+          cleanup() {
+            if [ -n "$EMP_ID" ]; then
+              curl --silent --show-error \
+                --connect-timeout 10 --max-time 30 \
+                --request DELETE \
+                "$BASE_URL/api/v1/employees/$EMP_ID" \
+                --output /dev/null || true
+            fi
+            if [ -n "$PF_PID" ]; then
+              kill "$PF_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          kubectl port-forward \
+            --namespace "$DEPLOY_NAMESPACE" \
+            "svc/${SERVICE_NAME}" "${LOCAL_PORT}:${SERVICE_PORT}" \
+            > "${RUNNER_TEMP}/smoke-port-forward.log" 2>&1 &
+          PF_PID=$!
+
+          # Wait for the health endpoint to answer 200.
+          STATUS="000"
+          for _ in $(seq 1 30); do
+            STATUS=$(
+              curl --silent \
+                --connect-timeout 2 --max-time 5 \
+                --output /dev/null --write-out '%{http_code}' \
+                "$BASE_URL/health/live" || true
+            )
+            [ "$STATUS" = "200" ] && break
+            sleep 2
+          done
 
           if [ "$STATUS" != "200" ]; then
             echo "Health check failed: HTTP $STATUS"
+            echo "--- port-forward log ---"
+            cat "${RUNNER_TEMP}/smoke-port-forward.log" || true
             exit 1
           fi
 
@@ -266,16 +318,6 @@ jobs:
               | jq -er '.id | select(. != null and . != "") | tostring | @uri'
           )
 
-          cleanup_employee() {
-            curl --fail-with-body --silent --show-error \
-              --connect-timeout 10 --max-time 30 \
-              --request DELETE \
-              "$BASE_URL/api/v1/employees/$EMP_ID" \
-              --output /dev/null
-          }
-
-          trap 'cleanup_employee || true' EXIT
-
           GET=$(
             curl --fail-with-body --silent --show-error \
               --connect-timeout 10 --max-time 30 \
@@ -289,8 +331,14 @@ jobs:
             exit 1
           fi
 
-          cleanup_employee
-          trap - EXIT
+          # Explicit cleanup on success; the EXIT trap handles failures.
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --request DELETE \
+            "$BASE_URL/api/v1/employees/$EMP_ID" \
+            --output /dev/null
+          EMP_ID=""
+
           echo "Smoke tests passed"
 
       - name: Roll back after failed smoke tests
