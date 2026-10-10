@@ -2,12 +2,10 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - "**"
+    branches: [main]
   pull_request:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [main]
+  # workflow_dispatch:
 
 permissions:
   contents: read
