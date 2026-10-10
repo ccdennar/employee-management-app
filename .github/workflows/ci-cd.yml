@@ -68,7 +68,6 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: staging
-    if: false # DISABLED: Waiting for remote cluster kubeconfig
     steps:
       - uses: actions/checkout@v4
       
@@ -78,7 +77,7 @@ jobs:
           ls -la kubeconfig
           head -n 3 kubeconfig
           kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
-            echo " CLUSTER UNREACHABLE - Verify KUBECONFIG secret"
+            echo "❌ CLUSTER UNREACHABLE - Verify KUBECONFIG secret"
             exit 1
           }
       
@@ -99,7 +98,6 @@ jobs:
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: staging
-    if: false # DISABLED: Waiting for remote cluster kubeconfig
     steps:
       - name: Configure kubectl
         run: |
@@ -135,7 +133,7 @@ jobs:
   rollback:
     needs: smoke-test
     runs-on: ubuntu-latest
-    # if: failure() # Only runs if smoke-test fails (currently disabled by parent job)
+    if: failure()
     environment: staging
     steps:
       - name: Configure kubectl
