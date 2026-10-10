@@ -1,19 +1,15 @@
----
 name: CI/CD Pipeline
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
+   push:
+     branches:  [main]
+   pull_request:
+      branches: [main]
 
 jobs:
   test:
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:15
@@ -45,12 +41,13 @@ jobs:
 
       - name: Run tests
         env:
-          DATABASE_URL: >-
-            postgresql://postgres:postgres@localhost:5432/employee_db
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/employee_db
         run: pytest tests/ -v
 
   build-and-push:
+    # Build independently so test failures do not hide build results.
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: write
@@ -64,17 +61,13 @@ jobs:
         shell: bash
         run: |
           REPOSITORY="${GITHUB_REPOSITORY,,}"
-          echo "name=ghcr.io/${REPOSITORY}/employee-api" \
-            >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/${REPOSITORY}/employee-api" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Only login and push on main branch pushes
       - name: Log in to GitHub Container Registry
-        if: >-
-          github.ref == 'refs/heads/main' &&
-          github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -85,22 +78,18 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: >-
-            ${{
-              github.ref == 'refs/heads/main' &&
-              github.event_name != 'pull_request'
-            }}
+          push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:latest
 
   deploy-staging:
+    # Deployment requires both tests and image publication to succeed.
     needs: [test, build-and-push]
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: staging
+
     concurrency:
       group: employee-api-staging
       cancel-in-progress: false
@@ -110,10 +99,8 @@ jobs:
       packages: read
 
     env:
-      KUBECONFIG: >-
-        ${{ runner.temp }}/vcluster-kubeconfig
-      HELM_CHART: >-
-        oci://ghcr.io/ccdennar/helm-charts/employee-api
+      KUBECONFIG: ${{ runner.temp }}/vcluster-kubeconfig
+      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
       HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
       STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
       IMAGE_TAG: ${{ github.sha }}
@@ -139,33 +126,38 @@ jobs:
       - name: Configure vCluster access
         shell: bash
         env:
-          VCLUSTER_KUBECONFIG_BASE64: >-
-            ${{ secrets.VCLUSTER_KUBECONFIG_BASE64 }}
+          VCLUSTER_KUBECONFIG_BASE64: ${{ secrets.VCLUSTER_KUBECONFIG_BASE64 }}
         run: |
           set -euo pipefail
           umask 077
+
           : "${VCLUSTER_KUBECONFIG_BASE64:?Set staging secret VCLUSTER_KUBECONFIG_BASE64}"
 
           printf '%s' "$VCLUSTER_KUBECONFIG_BASE64" \
             | base64 --decode > "$KUBECONFIG"
 
           kubectl config view --minify -o json | python3 -c '
-          import json, sys
+          import json
+          import sys
+
           config = json.load(sys.stdin)
-          refs = []
-          for c in config.get("clusters", []):
-              ca = c.get("cluster", {}).get("certificate-authority")
-              if ca:
-                  refs.append("certificate-authority")
-          for u in config.get("users", []):
-              user = u.get("user", {})
-              for f in ("client-certificate", "client-key", "tokenFile"):
-                  if user.get(f):
-                      refs.append(f)
-          if refs:
+          references = []
+
+          for entry in config.get("clusters", []):
+              if entry.get("cluster", {}).get("certificate-authority"):
+                  references.append("certificate-authority")
+
+          for entry in config.get("users", []):
+              user = entry.get("user", {})
+              for field in ("client-certificate", "client-key", "tokenFile"):
+                  if user.get(field):
+                      references.append(field)
+
+          if references:
               sys.exit(
-                  "Kubeconfig references local files: "
-                  + ", ".join(refs)
+                  "Kubeconfig references local credential files: "
+                  + ", ".join(references)
+                  + ". Supply a self-contained vCluster kubeconfig."
               )
           '
 
@@ -188,6 +180,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           REVISION=$(
             helm list \
               --namespace "$DEPLOY_NAMESPACE" \
@@ -196,6 +189,7 @@ jobs:
               --output json \
             | jq -r '.[0].revision // empty'
           )
+
           printf 'revision=%s\n' "$REVISION" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to vCluster
@@ -203,7 +197,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           REPOSITORY="${GITHUB_REPOSITORY,,}"
+
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
             --version "$HELM_CHART_VERSION" \
             --namespace "$DEPLOY_NAMESPACE" \
@@ -213,9 +209,6 @@ jobs:
             --atomic \
             --wait \
             --timeout 300s
-
-      - name: Install jq for smoke tests
-        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Smoke tests
         id: smoke
@@ -229,69 +222,88 @@ jobs:
             --timeout=300s
 
           STATUS=$(
-            curl --fail-with-body --silent --show-error \
+            curl --silent --show-error \
               --connect-timeout 10 --max-time 30 \
               --output /dev/null --write-out '%{http_code}' \
               "$BASE_URL/health/live"
           )
-          [ "$STATUS" = "200" ] || {
-            echo "Health check failed: HTTP $STATUS"; exit 1;
-          }
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed: HTTP $STATUS"
+            exit 1
+          fi
 
           EMAIL="smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}@example.com"
-          PAYLOAD=$(jq -n --arg email "$EMAIL" '{
-            first_name: "Smoke", last_name: "Test", email: $email,
-            department: "QA", job_title: "Tester", salary: 1,
-            employment_status: "ACTIVE"
-          }')
 
-          CREATE=$(curl --fail-with-body --silent --show-error \
-            --connect-timeout 10 --max-time 30 \
-            --request POST "$BASE_URL/api/v1/employees" \
-            --header "Content-Type: application/json" \
-            --data "$PAYLOAD")
+          PAYLOAD=$(
+            jq -n --arg email "$EMAIL" '{
+              first_name: "Smoke",
+              last_name: "Test",
+              email: $email,
+              department: "QA",
+              job_title: "Tester",
+              salary: 1,
+              employment_status: "ACTIVE"
+            }'
+          )
 
-          EMP_ID=$(printf '%s' "$CREATE" \
-            | jq -er '.id | select(. != null and . != "") | tostring | @uri')
+          CREATE=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --request POST "$BASE_URL/api/v1/employees" \
+              --header "Content-Type: application/json" \
+              --data "$PAYLOAD"
+          )
+
+          EMP_ID=$(
+            printf '%s' "$CREATE" \
+              | jq -er '.id | select(. != null and . != "") | tostring | @uri'
+          )
 
           cleanup_employee() {
             curl --fail-with-body --silent --show-error \
               --connect-timeout 10 --max-time 30 \
-              --request DELETE "$BASE_URL/api/v1/employees/$EMP_ID" \
-              --output /dev/null || true
+              --request DELETE \
+              "$BASE_URL/api/v1/employees/$EMP_ID" \
+              --output /dev/null
           }
-          trap 'cleanup_employee' EXIT
 
-          GET=$(curl --fail-with-body --silent --show-error \
-            --connect-timeout 10 --max-time 30 \
-            "$BASE_URL/api/v1/employees/$EMP_ID")
+          trap 'cleanup_employee || true' EXIT
+
+          GET=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              "$BASE_URL/api/v1/employees/$EMP_ID"
+          )
 
           NAME=$(printf '%s' "$GET" | jq -er '.first_name')
-          [ "$NAME" = "Smoke" ] || {
-            echo "Expected Smoke, got $NAME"; exit 1;
-          }
+
+          if [ "$NAME" != "Smoke" ]; then
+            echo "Expected Smoke, got $NAME"
+            exit 1
+          fi
 
           cleanup_employee
           trap - EXIT
-          echo "✅ Smoke tests passed"
+          echo "Smoke tests passed"
 
       - name: Roll back after failed smoke tests
-        if: >-
-          failure() &&
-          steps.deploy.outcome == 'success' &&
-          steps.smoke.outcome == 'failure'
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
         shell: bash
         env:
           PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
         run: |
           set -euo pipefail
+
           if [ -z "$PREVIOUS_REVISION" ]; then
             echo "First installation: no previous revision to restore."
             exit 1
           fi
+
           helm rollback "$RELEASE_NAME" "$PREVIOUS_REVISION" \
             --namespace "$DEPLOY_NAMESPACE" \
-            --wait --timeout 300s
+            --wait \
+            --timeout 300s
 
       - name: Remove kubeconfig
         if: always()
