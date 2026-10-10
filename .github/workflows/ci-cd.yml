@@ -1,3 +1,4 @@
+---
 name: CI/CD Pipeline
 
 on:
@@ -5,7 +6,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # workflow_dispatch:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,7 +45,8 @@ jobs:
 
       - name: Run tests
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/employee_db
+          DATABASE_URL: >-
+            postgresql://postgres:postgres@localhost:5432/employee_db
         run: pytest tests/ -v
 
   build-and-push:
@@ -62,13 +64,17 @@ jobs:
         shell: bash
         run: |
           REPOSITORY="${GITHUB_REPOSITORY,,}"
-          echo "name=ghcr.io/${REPOSITORY}/employee-api" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/${REPOSITORY}/employee-api" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Only login and push on main branch pushes
       - name: Log in to GitHub Container Registry
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -79,14 +85,20 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          push: >-
+            ${{
+              github.ref == 'refs/heads/main' &&
+              github.event_name != 'pull_request'
+            }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:latest
 
   deploy-staging:
     needs: [test, build-and-push]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
@@ -98,8 +110,10 @@ jobs:
       packages: read
 
     env:
-      KUBECONFIG: ${{ runner.temp }}/vcluster-kubeconfig
-      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
+      KUBECONFIG: >-
+        ${{ runner.temp }}/vcluster-kubeconfig
+      HELM_CHART: >-
+        oci://ghcr.io/ccdennar/helm-charts/employee-api
       HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
       STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
       IMAGE_TAG: ${{ github.sha }}
@@ -125,7 +139,8 @@ jobs:
       - name: Configure vCluster access
         shell: bash
         env:
-          VCLUSTER_KUBECONFIG_BASE64: ${{ secrets.VCLUSTER_KUBECONFIG_BASE64 }}
+          VCLUSTER_KUBECONFIG_BASE64: >-
+            ${{ secrets.VCLUSTER_KUBECONFIG_BASE64 }}
         run: |
           set -euo pipefail
           umask 077
@@ -139,7 +154,8 @@ jobs:
           config = json.load(sys.stdin)
           refs = []
           for c in config.get("clusters", []):
-              if c.get("cluster", {}).get("certificate-authority"):
+              ca = c.get("cluster", {}).get("certificate-authority")
+              if ca:
                   refs.append("certificate-authority")
           for u in config.get("users", []):
               user = u.get("user", {})
@@ -147,7 +163,10 @@ jobs:
                   if user.get(f):
                       refs.append(f)
           if refs:
-              sys.exit("Kubeconfig references local files: " + ", ".join(refs))
+              sys.exit(
+                  "Kubeconfig references local files: "
+                  + ", ".join(refs)
+              )
           '
 
           kubectl cluster-info --request-timeout=10s
@@ -215,7 +234,9 @@ jobs:
               --output /dev/null --write-out '%{http_code}' \
               "$BASE_URL/health/live"
           )
-          [ "$STATUS" = "200" ] || { echo "Health check failed: HTTP $STATUS"; exit 1; }
+          [ "$STATUS" = "200" ] || {
+            echo "Health check failed: HTTP $STATUS"; exit 1;
+          }
 
           EMAIL="smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}@example.com"
           PAYLOAD=$(jq -n --arg email "$EMAIL" '{
@@ -246,14 +267,19 @@ jobs:
             "$BASE_URL/api/v1/employees/$EMP_ID")
 
           NAME=$(printf '%s' "$GET" | jq -er '.first_name')
-          [ "$NAME" = "Smoke" ] || { echo "Expected Smoke, got $NAME"; exit 1; }
+          [ "$NAME" = "Smoke" ] || {
+            echo "Expected Smoke, got $NAME"; exit 1;
+          }
 
           cleanup_employee
           trap - EXIT
           echo "✅ Smoke tests passed"
 
       - name: Roll back after failed smoke tests
-        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
+        if: >-
+          failure() &&
+          steps.deploy.outcome == 'success' &&
+          steps.smoke.outcome == 'failure'
         shell: bash
         env:
           PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
