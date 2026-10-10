@@ -135,7 +135,7 @@ jobs:
   rollback:
     needs: smoke-test
     runs-on: ubuntu-latest
-    if: failure() # Only runs if smoke-test fails (currently disabled by parent job)
+    # if: failure() # Only runs if smoke-test fails (currently disabled by parent job)
     environment: staging
     steps:
       - name: Configure kubectl
