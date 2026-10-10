@@ -1,10 +1,10 @@
 name: CI/CD Pipeline
 
 on:
-   push:
-     branches:  [main]
-   pull_request:
-      branches: [main]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   test:
@@ -33,6 +33,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -98,8 +99,9 @@ jobs:
       contents: read
       packages: read
 
+    # NOTE: the `runner` context is NOT available at job-level env,
+    # so KUBECONFIG is exported from a step instead (see "Set kubeconfig path").
     env:
-      KUBECONFIG: ${{ runner.temp }}/vcluster-kubeconfig
       HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
       HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
       STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
@@ -108,6 +110,10 @@ jobs:
       DEPLOY_NAMESPACE: staging
 
     steps:
+      - name: Set kubeconfig path
+        shell: bash
+        run: echo "KUBECONFIG=${RUNNER_TEMP}/vcluster-kubeconfig" >> "$GITHUB_ENV"
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
@@ -308,4 +314,7 @@ jobs:
       - name: Remove kubeconfig
         if: always()
         shell: bash
-        run: rm -f "$KUBECONFIG"
+        run: |
+          if [ -n "${KUBECONFIG:-}" ]; then
+            rm -f "$KUBECONFIG"
+          fi
