@@ -88,7 +88,7 @@ jobs:
     # Deployment requires both tests and image publication to succeed.
     needs: [test, build-and-push]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: staging
 
     concurrency:
