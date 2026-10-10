@@ -26,14 +26,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run Tests
         env:
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/employee_db"
@@ -49,12 +52,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
         with:
@@ -68,22 +73,23 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: staging
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Configure kubectl
+        shell: bash
+        env:
+          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
         run: |
-          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
-          ls -la kubeconfig
-          head -n 3 kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
-            echo "❌ CLUSTER UNREACHABLE - Verify KUBECONFIG secret"
-            exit 1
-          }
-      
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
+
       - name: Install Helm
         run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-      
+
       - name: Deploy to Staging
         run: |
           helm upgrade --install employee-api \
@@ -98,36 +104,52 @@ jobs:
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: staging
+
     steps:
       - name: Configure kubectl
+        shell: bash
+        env:
+          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
         run: |
-          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
-            echo "❌ CLUSTER UNREACHABLE in smoke-test"
-            exit 1
-          }
-      
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
+
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
-      
+
       - name: Wait for Rollout
-        run: kubectl rollout status deployment/employee-api --namespace staging --timeout=300s --kubeconfig kubeconfig
-      
+        run: |
+          kubectl rollout status deployment/employee-api \
+            --namespace staging \
+            --timeout=300s \
+            --kubeconfig kubeconfig
+
       - name: Health Check
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://staging.employee-api.example.com/health/live)
-          [ "$STATUS" = "200" ] || { echo "Health check failed: $STATUS"; exit 1; }
-      
+          [ "$STATUS" = "200" ] || {
+            echo "Health check failed: $STATUS"
+            exit 1
+          }
+
       - name: Create-Delete Cycle
         run: |
           CREATE=$(curl -s -X POST https://staging.employee-api.example.com/api/v1/employees \
             -H "Content-Type: application/json" \
             -d '{"first_name":"Smoke","last_name":"Test","email":"smoke@test.com","department":"QA","job_title":"Tester","salary":1,"employment_status":"ACTIVE"}')
+
           EMP_ID=$(echo "$CREATE" | jq '.id')
-          GET=$(curl -s https://staging.employee-api.example.com/api/v1/employees/$EMP_ID)
+          GET=$(curl -s "https://staging.employee-api.example.com/api/v1/employees/$EMP_ID")
           NAME=$(echo "$GET" | jq -r '.first_name')
-          [ "$NAME" = "Smoke" ] || { echo "Expected Smoke, got $NAME"; exit 1; }
-          curl -s -X DELETE https://staging.employee-api.example.com/api/v1/employees/$EMP_ID
+
+          [ "$NAME" = "Smoke" ] || {
+            echo "Expected Smoke, got $NAME"
+            exit 1
+          }
+
+          curl -s -X DELETE "https://staging.employee-api.example.com/api/v1/employees/$EMP_ID"
           echo "✅ Smoke test passed"
 
   rollback:
@@ -135,17 +157,23 @@ jobs:
     runs-on: ubuntu-latest
     if: failure()
     environment: staging
+
     steps:
       - name: Configure kubectl
+        shell: bash
+        env:
+          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG }}
         run: |
-          echo -n "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
-          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s || {
-            echo "❌ CLUSTER UNREACHABLE during rollback"
-            exit 1
-          }
-      
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KUBECONFIG_BASE64" | base64 --decode > kubeconfig
+          kubectl --kubeconfig kubeconfig cluster-info --request-timeout=10s
+
       - name: Install Helm
         run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-      
+
       - name: Rollback
-        run: helm rollback employee-api --namespace staging --kubeconfig kubeconfig
+        run: |
+          helm rollback employee-api \
+            --namespace staging \
+            --kubeconfig kubeconfig
