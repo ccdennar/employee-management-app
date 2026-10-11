@@ -97,7 +97,7 @@ jobs:
     needs: [test, build-and-push]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     # Runs on the Mac that hosts minikube/vCluster (the cluster is only
-    # reachable from that machine via 127.0.0.1:8443 port-forward).
+    # reachable from that machine via a 127.0.0.1:8443 port-forward).
     runs-on: [self-hosted, macOS, ARM64]
     environment: staging
 
@@ -112,7 +112,8 @@ jobs:
     # NOTE: the `runner` context is NOT available at job-level env,
     # so KUBECONFIG is exported from a step instead.
     env:
-      HELM_CHART: ./charts/employee-api
+      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
+      HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
       IMAGE_TAG: ${{ github.sha }}
       RELEASE_NAME: employee-api
       DEPLOY_NAMESPACE: staging
@@ -121,9 +122,6 @@ jobs:
       SERVICE_NAME: ${{ vars.SERVICE_NAME || 'employee-api' }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Set kubeconfig path and tool PATH
         shell: bash
         run: |
@@ -151,12 +149,11 @@ jobs:
             }
           done
 
-      - name: Lint Helm chart
+      - name: Validate deployment settings
         shell: bash
         run: |
           set -euo pipefail
-          helm lint "$HELM_CHART"
-          helm template "$RELEASE_NAME" "$HELM_CHART" > /dev/null
+          : "${HELM_CHART_VERSION:?Set staging variable HELM_CHART_VERSION}"
 
       - name: Ensure host port-forward to the vCluster
         shell: bash
@@ -238,12 +235,34 @@ jobs:
 
           kubectl cluster-info --request-timeout=10s
 
+      - name: Log in to Helm registry
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" \
+            | helm registry login ghcr.io \
+                --username "$GHCR_USERNAME" \
+                --password-stdin
+
+      - name: Show the chart that will be deployed
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fails early (with a clear message) if this chart version was never published.
+          helm show chart "$HELM_CHART" --version "$HELM_CHART_VERSION" \
+            | grep -E '^(name|version|appVersion):'
+
       - name: Record previous release revision
         id: previous
         shell: bash
         run: |
           set -euo pipefail
 
+          # Only a revision that is actually "deployed" counts as a safe
+          # rollback target; a failed release must not be restored.
           REVISION=$(
             helm list \
               --namespace "$DEPLOY_NAMESPACE" \
@@ -271,6 +290,7 @@ jobs:
           # diagnostics first, then restore the previous state ourselves.
           set +e
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
+            --version "$HELM_CHART_VERSION" \
             --namespace "$DEPLOY_NAMESPACE" \
             --create-namespace \
             --set-string image.repository="ghcr.io/${REPOSITORY}/employee-api" \
@@ -317,6 +337,37 @@ jobs:
             fi
 
             exit "$HELM_EXIT"
+          fi
+
+      - name: Validate pod environment before smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          POD_LABEL="app.kubernetes.io/instance=${RELEASE_NAME}"
+
+          # Does the pod define DATABASE_URL at all (plain value or secretKeyRef)?
+          ENV_NAME=$(kubectl get pod --namespace "$DEPLOY_NAMESPACE" \
+            -l "$POD_LABEL" \
+            -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].name}')
+
+          if [ -z "$ENV_NAME" ]; then
+            echo "FATAL: DATABASE_URL is not set in the pod environment."
+            echo "The published chart version ${HELM_CHART_VERSION} does not configure the database."
+            kubectl describe pod --namespace "$DEPLOY_NAMESPACE" -l "$POD_LABEL" \
+              | grep -A 20 "Environment:" || true
+            exit 1
+          fi
+
+          DB_URL=$(kubectl get pod --namespace "$DEPLOY_NAMESPACE" \
+            -l "$POD_LABEL" \
+            -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].value}')
+
+          if [ -n "$DB_URL" ]; then
+            # Mask credentials in the log.
+            echo "DATABASE_URL configured: $(printf '%s' "$DB_URL" | sed 's#://[^:]*:[^@]*@#://***:***@#')"
+          else
+            echo "DATABASE_URL configured (from a Secret reference)."
           fi
 
       - name: Smoke tests
