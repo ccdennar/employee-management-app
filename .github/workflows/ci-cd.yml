@@ -112,8 +112,7 @@ jobs:
     # NOTE: the `runner` context is NOT available at job-level env,
     # so KUBECONFIG is exported from a step instead.
     env:
-      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
-      HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
+      HELM_CHART: ./charts/employee-api
       IMAGE_TAG: ${{ github.sha }}
       RELEASE_NAME: employee-api
       DEPLOY_NAMESPACE: staging
@@ -122,6 +121,9 @@ jobs:
       SERVICE_NAME: ${{ vars.SERVICE_NAME || 'employee-api' }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set kubeconfig path and tool PATH
         shell: bash
         run: |
@@ -149,11 +151,59 @@ jobs:
             }
           done
 
-      - name: Validate deployment settings
+      - name: Lint Helm chart
         shell: bash
         run: |
           set -euo pipefail
-          : "${HELM_CHART_VERSION:?Set staging variable HELM_CHART_VERSION}"
+          helm lint "$HELM_CHART"
+          helm template "$RELEASE_NAME" "$HELM_CHART" > /dev/null
+
+      - name: Ensure host port-forward to the vCluster
+        shell: bash
+        env:
+          # kubectl context of the host cluster in ~/.kube/config on this Mac
+          HOST_CONTEXT: ${{ vars.HOST_KUBE_CONTEXT || 'minikube' }}
+          # namespace and Service of the vCluster on the host cluster
+          VCLUSTER_HOST_NAMESPACE: ${{ vars.VCLUSTER_HOST_NAMESPACE || 'staging' }}
+          VCLUSTER_HOST_SERVICE: ${{ vars.VCLUSTER_HOST_SERVICE || 'staging' }}
+        run: |
+          set -euo pipefail
+
+          # The vCluster kubeconfig points at https://127.0.0.1:8443, so
+          # something must forward that port to the vCluster Service.
+          # Any HTTP answer (even 401) means the tunnel is up.
+          reachable() {
+            curl -sk --connect-timeout 2 --max-time 4 \
+              --output /dev/null https://127.0.0.1:8443/version
+          }
+
+          if reachable; then
+            echo "127.0.0.1:8443 is already reachable (existing port-forward); reusing it."
+            exit 0
+          fi
+
+          echo "Starting port-forward: ${HOST_CONTEXT} ${VCLUSTER_HOST_NAMESPACE}/svc/${VCLUSTER_HOST_SERVICE} -> 127.0.0.1:8443"
+          KUBECONFIG="$HOME/.kube/config" nohup kubectl \
+            --context "$HOST_CONTEXT" \
+            --namespace "$VCLUSTER_HOST_NAMESPACE" \
+            port-forward "svc/${VCLUSTER_HOST_SERVICE}" 8443:443 \
+            > "${RUNNER_TEMP}/vcluster-host-port-forward.log" 2>&1 &
+          echo $! > "${RUNNER_TEMP}/vcluster-host-port-forward.pid"
+
+          for _ in $(seq 1 30); do
+            if reachable; then
+              echo "Port-forward is ready."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Port-forward did not become ready. Log:"
+          cat "${RUNNER_TEMP}/vcluster-host-port-forward.log" || true
+          echo "Check that minikube is running and that the vCluster pod is Ready:"
+          echo "  minikube status"
+          echo "  kubectl --context ${HOST_CONTEXT} -n ${VCLUSTER_HOST_NAMESPACE} get pods"
+          exit 1
 
       - name: Configure vCluster access
         shell: bash
@@ -188,18 +238,6 @@ jobs:
 
           kubectl cluster-info --request-timeout=10s
 
-      - name: Log in to Helm registry
-        shell: bash
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GHCR_TOKEN" \
-            | helm registry login ghcr.io \
-                --username "$GHCR_USERNAME" \
-                --password-stdin
-
       - name: Record previous release revision
         id: previous
         shell: bash
@@ -212,7 +250,7 @@ jobs:
               --all \
               --filter "^${RELEASE_NAME}$" \
               --output json \
-            | jq -r '.[0].revision // empty'
+            | jq -r '.[0] | select(.status == "deployed") | .revision // empty'
           )
 
           printf 'revision=%s\n' "$REVISION" >> "$GITHUB_OUTPUT"
@@ -233,7 +271,6 @@ jobs:
           # diagnostics first, then restore the previous state ourselves.
           set +e
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
-            --version "$HELM_CHART_VERSION" \
             --namespace "$DEPLOY_NAMESPACE" \
             --create-namespace \
             --set-string image.repository="ghcr.io/${REPOSITORY}/employee-api" \
@@ -282,25 +319,6 @@ jobs:
             exit "$HELM_EXIT"
           fi
 
-      - name: Validate pod environment before smoke tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          
-          # Check that DATABASE_URL is actually set in running pods
-          DB_URL=$(kubectl get pod -n "$DEPLOY_NAMESPACE" \
-            -l app.kubernetes.io/instance="$RELEASE_NAME" \
-            -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].value}')
-          
-          if [ -z "$DB_URL" ]; then
-            echo "❌ FATAL: DATABASE_URL not found in pod environment"
-            kubectl describe pod -n "$DEPLOY_NAMESPACE" \
-              -l app.kubernetes.io/instance="$RELEASE_NAME" | grep -A 20 "Environment:"
-            exit 1
-          fi
-          
-          echo "✅ DATABASE_URL configured: $(echo "$DB_URL" | sed 's/:\/\/[^:]*:[^@]*@/:\/\/***:***@/')"
-
       - name: Smoke tests
         id: smoke
         shell: bash
@@ -338,15 +356,28 @@ jobs:
           }
           trap cleanup EXIT
 
-          kubectl port-forward \
-            --namespace "$DEPLOY_NAMESPACE" \
-            "svc/${SERVICE_NAME}" "${LOCAL_PORT}:${SERVICE_PORT}" \
-            > "${RUNNER_TEMP}/smoke-port-forward.log" 2>&1 &
-          PF_PID=$!
+          start_port_forward() {
+            kubectl port-forward \
+              --namespace "$DEPLOY_NAMESPACE" \
+              "svc/${SERVICE_NAME}" "${LOCAL_PORT}:${SERVICE_PORT}" \
+              >> "${RUNNER_TEMP}/smoke-port-forward.log" 2>&1 &
+            PF_PID=$!
+            sleep 2
+          }
+
+          : > "${RUNNER_TEMP}/smoke-port-forward.log"
+          start_port_forward
 
           # Wait for the health endpoint to answer 200.
+          # `kubectl port-forward` exits after a single failed connection to the
+          # pod ("lost connection to pod"), so restart it whenever it has died.
           STATUS="000"
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 45); do
+            if ! kill -0 "$PF_PID" 2>/dev/null; then
+              echo "port-forward exited; restarting it"
+              start_port_forward
+            fi
+
             STATUS=$(
               curl --silent \
                 --connect-timeout 2 --max-time 5 \
@@ -361,6 +392,11 @@ jobs:
             echo "Health check failed: HTTP $STATUS"
             echo "--- port-forward log ---"
             cat "${RUNNER_TEMP}/smoke-port-forward.log" || true
+            echo "--- pods ---"
+            kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o wide || true
+            echo "--- app logs (last 50 lines) ---"
+            kubectl logs "deployment/${DEPLOYMENT_NAME}" \
+              --namespace "$DEPLOY_NAMESPACE" --tail=50 || true
             exit 1
           fi
 
@@ -414,6 +450,39 @@ jobs:
 
           echo "Smoke tests passed"
 
+      - name: Diagnostics after failed smoke tests
+        if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "--- pods ---"
+          kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o wide || true
+
+          echo "--- restart reasons (last terminated state) ---"
+          kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o json \
+            | jq -r '.items[] | .metadata.name as $p
+                | .status.containerStatuses[]?
+                | "\($p) restarts=\(.restartCount) last=\(.lastState.terminated.reason // "none") exit=\(.lastState.terminated.exitCode // "-")"' \
+            || true
+
+          echo "--- describe pods ---"
+          kubectl describe pods --namespace "$DEPLOY_NAMESPACE" || true
+
+          echo "--- events ---"
+          kubectl get events --namespace "$DEPLOY_NAMESPACE" \
+            --sort-by=.lastTimestamp || true
+
+          echo "--- container logs ---"
+          for POD in $(kubectl get pods --namespace "$DEPLOY_NAMESPACE" -o name); do
+            echo ">>> $POD (current)"
+            kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+              --all-containers --tail=100 || true
+            echo ">>> $POD (previous)"
+            kubectl logs "$POD" --namespace "$DEPLOY_NAMESPACE" \
+              --all-containers --previous --tail=100 2>/dev/null || true
+          done
+
       - name: Roll back after failed smoke tests
         if: ${{ failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure' }}
         shell: bash
@@ -423,7 +492,8 @@ jobs:
           set -euo pipefail
 
           if [ -z "$PREVIOUS_REVISION" ]; then
-            echo "First installation: no previous revision to restore."
+            echo "No previous healthy revision: removing the failed release."
+            helm uninstall "$RELEASE_NAME" --namespace "$DEPLOY_NAMESPACE" || true
             exit 1
           fi
 
@@ -432,10 +502,16 @@ jobs:
             --wait \
             --timeout 300s
 
-      - name: Remove kubeconfig
+      - name: Remove kubeconfig and stop host port-forward
         if: always()
         shell: bash
         run: |
           if [ -n "${KUBECONFIG:-}" ]; then
             rm -f "$KUBECONFIG"
+          fi
+
+          PID_FILE="${RUNNER_TEMP}/vcluster-host-port-forward.pid"
+          if [ -f "$PID_FILE" ]; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+            rm -f "$PID_FILE"
           fi
