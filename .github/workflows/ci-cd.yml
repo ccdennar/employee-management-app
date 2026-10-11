@@ -233,7 +233,15 @@ jobs:
             exit 1
           fi
 
-          kubectl cluster-info --request-timeout=10s
+          if ! kubectl cluster-info --request-timeout=10s; then
+            echo ""
+            echo "Could not reach the vCluster with the stored kubeconfig."
+            echo "  - 'connection refused'            -> the host port-forward on 127.0.0.1:8443 is not running"
+            echo "  - 'x509: certificate signed by unknown authority'"
+            echo "                                    -> the vCluster was recreated; regenerate the"
+            echo "                                       VCLUSTER_KUBECONFIG_BASE64 secret from the current one"
+            exit 1
+          fi
 
       - name: Log in to Helm registry
         shell: bash
