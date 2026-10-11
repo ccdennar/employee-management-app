@@ -282,6 +282,25 @@ jobs:
             exit "$HELM_EXIT"
           fi
 
+      - name: Validate pod environment before smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Check that DATABASE_URL is actually set in running pods
+          DB_URL=$(kubectl get pod -n "$DEPLOY_NAMESPACE" \
+            -l app.kubernetes.io/instance="$RELEASE_NAME" \
+            -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].value}')
+          
+          if [ -z "$DB_URL" ]; then
+            echo "❌ FATAL: DATABASE_URL not found in pod environment"
+            kubectl describe pod -n "$DEPLOY_NAMESPACE" \
+              -l app.kubernetes.io/instance="$RELEASE_NAME" | grep -A 20 "Environment:"
+            exit 1
+          fi
+          
+          echo "✅ DATABASE_URL configured: $(echo "$DB_URL" | sed 's/:\/\/[^:]*:[^@]*@/:\/\/***:***@/')"
+
       - name: Smoke tests
         id: smoke
         shell: bash
