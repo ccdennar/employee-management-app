@@ -325,6 +325,7 @@ jobs:
         shell: bash
         env:
           PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
