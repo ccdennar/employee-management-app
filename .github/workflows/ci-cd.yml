@@ -112,8 +112,7 @@ jobs:
     # NOTE: the `runner` context is NOT available at job-level env,
     # so KUBECONFIG is exported from a step instead.
     env:
-      HELM_CHART: oci://ghcr.io/ccdennar/helm-charts/employee-api
-      HELM_CHART_VERSION: ${{ vars.HELM_CHART_VERSION }}
+      HELM_CHART: ./charts/employee-api
       IMAGE_TAG: ${{ github.sha }}
       RELEASE_NAME: employee-api
       DEPLOY_NAMESPACE: staging
@@ -122,6 +121,9 @@ jobs:
       SERVICE_NAME: ${{ vars.SERVICE_NAME || 'employee-api' }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set kubeconfig path and tool PATH
         shell: bash
         run: |
@@ -149,11 +151,12 @@ jobs:
             }
           done
 
-      - name: Validate deployment settings
+      - name: Lint Helm chart
         shell: bash
         run: |
           set -euo pipefail
-          : "${HELM_CHART_VERSION:?Set staging variable HELM_CHART_VERSION}"
+          helm lint "$HELM_CHART"
+          helm template "$RELEASE_NAME" "$HELM_CHART" > /dev/null
 
       - name: Configure vCluster access
         shell: bash
@@ -188,18 +191,6 @@ jobs:
 
           kubectl cluster-info --request-timeout=10s
 
-      - name: Log in to Helm registry
-        shell: bash
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GHCR_TOKEN" \
-            | helm registry login ghcr.io \
-                --username "$GHCR_USERNAME" \
-                --password-stdin
-
       - name: Record previous release revision
         id: previous
         shell: bash
@@ -212,7 +203,7 @@ jobs:
               --all \
               --filter "^${RELEASE_NAME}$" \
               --output json \
-            | jq -r '.[0].revision // empty'
+            | jq -r '.[0] | select(.status == "deployed") | .revision // empty'
           )
 
           printf 'revision=%s\n' "$REVISION" >> "$GITHUB_OUTPUT"
@@ -233,7 +224,6 @@ jobs:
           # diagnostics first, then restore the previous state ourselves.
           set +e
           helm upgrade --install "$RELEASE_NAME" "$HELM_CHART" \
-            --version "$HELM_CHART_VERSION" \
             --namespace "$DEPLOY_NAMESPACE" \
             --create-namespace \
             --set-string image.repository="ghcr.io/${REPOSITORY}/employee-api" \
@@ -437,7 +427,8 @@ jobs:
           set -euo pipefail
 
           if [ -z "$PREVIOUS_REVISION" ]; then
-            echo "First installation: no previous revision to restore."
+            echo "No previous healthy revision: removing the failed release."
+            helm uninstall "$RELEASE_NAME" --namespace "$DEPLOY_NAMESPACE" || true
             exit 1
           fi
 
